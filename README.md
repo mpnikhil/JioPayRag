@@ -36,7 +36,7 @@ Data was collected using two main approaches:
 1. **Web Scraping**: Python scripts using Selenium and BeautifulSoup were developed to scrape content from the JioPay Business website:
 
    - `js_faq_scraper.py`: Specialized scraper for the FAQ section with tailored selectors
-   - `simple_jio_pay_scraper.py`: Generic scraper for extracting content from various JioPay webpages
+   - `improved_jio_pay_scraper.py`: Generic scraper for extracting content from various JioPay webpages including FAQs on multiple pages
    - `run_jiopay_scraper.py`: Orchestration script that runs both scrapers sequentially
 
 2. **Manual Extraction**: Some FAQ content was manually curated to ensure quality and relevance.
@@ -161,7 +161,7 @@ jiopay-support-rag/
 │   └── jiopay_links_content.json
 ├── scrapers/
 │   ├── js_faq_scraper.py
-│   ├── simple_jio_pay_scraper.py
+│   ├── improved_jio_pay_scraper.py
 │   └── run_jiopay_scraper.py
 ├── faiss_index/
 │   ├── index.faiss
