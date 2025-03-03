@@ -13,6 +13,7 @@ This project implements a conversational AI assistant that can answer questions 
 - [Data Gathering and Preparation](#data-gathering-and-preparation)
 - [Tools and Technologies](#tools-and-technologies)
 - [RAG Implementation](#rag-implementation)
+- [Advanced Retrieval Techniques](#advanced-retrieval-techniques)
 - [Project Structure](#project-structure)
 - [Setup and Installation](#setup-and-installation)
 - [Usage](#usage)
@@ -42,15 +43,10 @@ Data was collected using two main approaches:
 
 ### Data Processing
 
-The collected data was processed and stored in multiple formats:
+The collected data was processed and stored in JSON format:
 
-- **JSON Files**: 
-  - `jiopay_help_center_faqs.json`: Comprehensive FAQs from the Help Center
-  - `jiopay_links_content.json`: Content from various website pages with metadata
-
-- **CSV Files**: 
-  - `jiopay_faqs.csv`: Tabular format of all FAQs with source, section, question, and answer
-  - `jiopay_links_content.csv`: General content from the website in a tabular format
+- `jiopay_help_center_faqs.json`: Comprehensive FAQs from the Help Center
+- `jiopay_links_content.json`: Content from various website pages with metadata
 
 ## Tools and Technologies
 
@@ -68,7 +64,6 @@ The collected data was processed and stored in multiple formats:
 ```
 langchain
 langchain_core
-langchain_text_splitters
 langchain_ollama
 faiss-cpu
 sentence-transformers
@@ -91,72 +86,79 @@ gradio
 The knowledge base is constructed through the following process:
 
 1. **Document Processing**:
-   - JSON and CSV files are loaded and converted to LangChain Document objects
+   - JSON files are loaded and converted to LangChain Document objects
    - FAQ content is processed differently from general website content
    - Metadata is preserved (source, section, title) for better context and citation
 
-2. **Chunking Strategy**:
-   - **FAQ Documents**: Kept intact to preserve question-answer pairs
-   - **General Content**: Split using RecursiveCharacterTextSplitter with:
-     - Chunk size: 1000 characters
-     - Chunk overlap: 200 characters
-     - Custom separators: paragraphs, sentences, spaces
+2. **Semantic Document Creation**:
+   - **FAQ Documents**: Instead of generic text splitting, we use semantic chunking that preserves the question-answer relationship
+   - **Alternative Document Formats**: For each FAQ, we create multiple document representations to enhance retrieval:
+     - Standard Q&A format
+     - Question-focused format (optimized for direct queries)
+     - Section-contextualized format (for topic-based retrieval)
+   - **Section Overviews**: Created to help with broad topic questions
 
 3. **Vector Embeddings**:
    - Model: BAAI/bge-base-en-v1.5 (optimized for retrieval tasks)
    - Embeddings are normalized for better similarity calculation
    - Device acceleration used when available (MPS on Apple Silicon)
 
-4. **Vector Store**:
-   - FAISS index for fast similarity search
-   - Local persistence to disk for reuse across sessions
+### Vector Store
 
-### Retrieval Process
+- **FAISS Index**: Efficient similarity search for embedding vectors
+- Local persistence to disk for reuse across sessions
 
-The retrieval process is optimized for JioPay customer support:
+## Advanced Retrieval Techniques
 
-1. **Query Processing**:
-   - User question is embedded using the same embedding model
-   - Semantic search in the vector space
+The system implements several advanced retrieval techniques to improve accuracy and relevance:
 
-2. **Document Retrieval**:
-   - Top-k retrieval (k=5) based on similarity scores
-   - Emphasis on FAQ content as they are kept intact
+### 1. LLM-Based Query Expansion
 
-3. **Context Formation**:
-   - Retrieved documents are concatenated
-   - Full context is passed to the LLM
+Rather than using hardcoded heuristics, the system uses the LLM itself to generate better search queries:
 
-### Language Model Integration
+- **Query Refinement**: The original user question is sent to the LLM to generate 3-4 alternative formulations
+- **Diverse Phrasing**: The LLM creates variations focusing on different aspects and terminology
+- **Keyword Extraction**: Technical terms and product names are preserved in the refined queries
+- **Fallback Mechanism**: System gracefully falls back to the original query if LLM refinement fails
 
-The system uses a locally-served LLM through Ollama:
+Benefits:
+- Adapts to new product terminology automatically
+- Generates semantically related terms humans might miss
+- Balances specificity and generality in search
 
-1. **Model**: Llama 3 (llama3.3:latest)
-2. **Temperature**: 0.1 (low temperature for factual responses)
-3. **Custom Prompt Template**:
-   ```
-   You are a helpful customer support assistant for JioPay.
-   Answer the following question based only on the provided context.
-   If the answer cannot be found in the context, suggest contacting JioPay support.
-   
-   Context:
-   {context}
-   
-   Question: {question}
-   
-   Answer:
-   ```
+### 2. Semantic Document Chunking
+
+Instead of raw text splitting which breaks question-answer pairs, the system:
+
+- Preserves structured JSON content in semantically meaningful units
+- Creates multiple document variants for each FAQ with different formats
+- Maintains metadata relationships between questions, answers, and sections
+- Includes section context documents for hierarchical understanding
+- Generates section overview documents for broad topic questions
+
+### 3. Maximum Marginal Relevance (MMR) Retrieval
+
+To balance relevance with diversity in search results:
+
+- **MMR Algorithm**: Retrieves a larger candidate set, then selects a diverse subset
+- **Configurable Parameters**:
+  - `k`: Number of documents to return (typically 4-5)
+  - `fetch_k`: Initial candidate pool size (typically 10-15)
+  - `lambda_mult`: Relevance-diversity tradeoff (0.7 balances both)
+- **Fallback to Similarity**: Automatically uses standard similarity search if MMR fails
+
+Benefits:
+- Reduces redundancy in retrieval results
+- Ensures broader coverage of relevant topics
+- Adapts to both specific and general questions
 
 ## Project Structure
 
 ```
 jiopay-support-rag/
 ├── data/
-│   ├── faq_data.json
 │   ├── jiopay_help_center_faqs.json
-│   ├── jiopay_links_content.json
-│   ├── jiopay_faqs.csv
-│   └── jiopay_links_content.csv
+│   └── jiopay_links_content.json
 ├── scrapers/
 │   ├── js_faq_scraper.py
 │   ├── simple_jio_pay_scraper.py
