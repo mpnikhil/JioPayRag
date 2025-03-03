@@ -6,6 +6,7 @@ import time
 import logging
 from datetime import datetime
 from typing import List, Dict, Tuple, Any, Optional
+import re
 
 # RAG components
 from langchain_core.documents import Document
@@ -160,6 +161,70 @@ Answer:"""
                 logger.debug(traceback.format_exc())
         
         return documents
+    
+    def refine_query_with_llm(self, original_query: str) -> List[str]:
+        """
+        Use the LLM to generate improved query formulations for better retrieval.
+
+        Args:
+            original_query: The user's original question
+
+        Returns:
+            List of refined query strings
+        """
+        logger.info(f"Refining query with LLM: '{original_query}'")
+
+        # Create a prompt to guide the LLM in generating better queries
+        refine_prompt = """You are an AI assistant helping to improve search queries for a JioPay customer support system.
+            Given the original user question, create 3 alternative search queries that would help retrieve relevant information.
+            
+            Guidelines for generating search queries:
+            1. Remove question words and conversational phrasing
+            2. Focus on key terms and product names
+            3. Include synonyms for technical terms
+            4. Create both specific and slightly broader formulations
+            5. Each query should be concise (3-8 keywords)
+            6. Format specific product names correctly (e.g., "JioPay", "VoiceBox")
+            
+            Original Question: {query}
+            
+            Output exactly 3 alternative search queries, one per line. Do not include any explanation or numbering.
+            """
+    
+        try:
+            # Use a lower temperature for more consistent and focused results
+            response = self.llm.invoke(
+                refine_prompt.format(query=original_query)
+            ).content
+
+            # Process the response
+            alternative_queries = []
+
+            # Extract each line as a query, removing any numbering or prefixes
+            for line in response.strip().split('\n'):
+                # Skip empty lines
+                line = line.strip()
+                if not line:
+                    continue
+
+                # Remove numbering patterns if present (e.g., "1. ", "- ", etc.)
+                clean_line = re.sub(r'^[\d\-\.\)\s]+', '', line).strip()
+
+                if clean_line and clean_line != original_query:
+                    alternative_queries.append(clean_line)
+
+            # Always include the original query
+            all_queries = [original_query] + alternative_queries
+
+            # Log the queries
+            logger.info(f"LLM query refinement: Original: '{original_query}' → Alternatives: {alternative_queries}")
+
+            return all_queries
+        except Exception as e:
+            logger.warning(f"Error in LLM query refinement: {str(e)}")
+            # Return just the original query if refinement fails
+            return [original_query]
+
     
     def load_site_content(self, site_content_file_path: str) -> List[Document]:
         """
@@ -564,119 +629,135 @@ Answer:"""
         
         return self.qa_chain
     
-    def answer_question(self, question: str) -> str:
+    def answer_question(self, question: str) -> Dict[str, Any]:
         """
-        Process a user question and return an answer.
-        
+        Process a user question and return an answer with LLM-based query refinement.
+
         Args:
             question: The user's question
-            
+
         Returns:
-            str: The generated answer
+            Dict containing the answer and citations
         """
         self.query_count += 1
         start_time = time.time()
-        
+
         logger.info(f"Query #{self.query_count}: \"{question}\"")
-        
+
         # Clear previous citations
         self.last_retrieved_docs = []
         if not self.qa_chain:
             logger.error("QA chain is not initialized. Please build the RAG chain first.")
             raise ValueError("QA chain is not initialized. Please build the RAG chain first.")
-        
-        # Detect question type to improve retrieval
-        question_lower = question.lower()
-        search_filter = None
-        
-        # Use metadata filters based on question type if appropriate
-        filter_terms = {
-            "Refunds": ["refund", "money back", "return payment", "cancel payment"],
-            "Settlement": ["settlement", "receive money", "funds", "deposit"],
-            "Voicebox": ["voice", "voicebox", "speaker", "audio", "sound"],
-            "JioPay Business App": ["app", "mobile app", "download app", "android app"],
-            "Campaign": ["campaign", "promotion", "offer", "discount"],
-            "Collect link": ["collect link", "payment link", "generate link"]
-        }
-        
-        # Check if question matches any filter terms
-        for section, terms in filter_terms.items():
-            if any(term in question_lower for term in terms):
-                search_filter = {"section": section}
-                logger.info(f"Applied filter for section: {section}")
-                break
-        
-        # Generate the response
+
+        # Generate the response using LLM-refined queries
         try:
+            # Generate refined queries
+            query_refinement_start = time.time()
+            refined_queries = self.refine_query_with_llm(question)
+            query_refinement_time = time.time() - query_refinement_start
+            logger.info(f"Query refinement completed in {query_refinement_time:.2f} seconds")
+
+            # Retrieval phase
             retrieval_start = time.time()
-            
-            # If we have a filter, use it
-            if search_filter and self.vectorstore:
+            all_docs = []
+
+            # Create both similarity and MMR retrievers
+            similarity_retriever = self.vectorstore.as_retriever(
+                search_type="similarity",
+                search_kwargs={"k": 4}  # Fetch fewer docs per query since we'll have multiple queries
+            )
+
+            # Try to create an MMR retriever if supported
+            mmr_retriever = None
+            try:
+                mmr_retriever = self.vectorstore.as_retriever(
+                    search_type="mmr",
+                    search_kwargs={"k": 4, "fetch_k": 15, "lambda_mult": 0.7}
+                )
+            except:
+                # Fall back to similarity if MMR is not supported
+                mmr_retriever = similarity_retriever
+
+            # Track how many documents each query retrieves
+            query_doc_counts = {}
+
+            # Retrieve documents with each query
+            for i, query in enumerate(refined_queries):
+                # Use MMR for the original query and similarity for refined queries
+                retriever = mmr_retriever if i == 0 else similarity_retriever
+
+                # Retrieve docs
+                retrieved_docs = retriever.invoke(query)
+
+                # Track metrics
+                query_doc_counts[query] = len(retrieved_docs)
+
+                # Add to collection
+                all_docs.extend(retrieved_docs)
+
                 if self.debug:
-                    logger.debug(f"Using filtered retriever with filter: {search_filter}")
-                
-                filtered_retriever = self.vectorstore.as_retriever(
-                    search_type="similarity",
-                    search_kwargs={"k": 5, "filter": search_filter}
-                )
-                
-                # Format documents function
-                def format_docs(docs):
-                    """Format documents and store them for citation purposes."""
-                    # Store the documents for citation generation
-                    self.last_retrieved_docs = docs
-                    
-                    if self.debug:
-                        logger.debug(f"Retrieved {len(docs)} documents with filter")
-                        for i, doc in enumerate(docs):
-                            logger.debug(f"Doc {i+1} - {doc.metadata.get('type')} - {doc.metadata.get('section')}")
-                    
-                    # Format for the context
-                    return "\n\n".join([doc.page_content for doc in docs])
-                
-                # Create a temporary chain with the filtered retriever
-                temp_chain = (
-                    {"context": filtered_retriever | format_docs, "question": RunnablePassthrough()}
-                    | PromptTemplate.from_template(self.prompt_template)
-                    | self.llm
-                    | StrOutputParser()
-                )
-                
-                # Use the filtered chain
-                retrieval_time = time.time() - retrieval_start
-                logger.info(f"Retrieval completed in {retrieval_time:.2f} seconds")
-                
-                generation_start = time.time()
-                response = temp_chain.invoke(question)
-                generation_time = time.time() - generation_start
-                
+                    logger.debug(f"Query '{query}' retrieved {len(retrieved_docs)} documents")
+
+            # Remove duplicates
+            unique_docs = []
+            seen_content = set()
+
+            for doc in all_docs:
+                # Create a hash of the first part of content to catch near-duplicates
+                content_hash = hash(doc.page_content[:150])
+                if content_hash not in seen_content:
+                    unique_docs.append(doc)
+                    seen_content.add(content_hash)
+
+            retrieval_time = time.time() - retrieval_start
+            logger.info(f"Multi-query retrieval completed in {retrieval_time:.2f} seconds")
+            logger.info(f"Retrieved {len(unique_docs)} unique documents from {len(refined_queries)} queries")
+
+            # Split docs by type to prioritize FAQs
+            faq_docs = [doc for doc in unique_docs if doc.metadata.get("type", "").startswith("faq")]
+            other_docs = [doc for doc in unique_docs if not doc.metadata.get("type", "").startswith("faq")]
+
+            # Combine with FAQs first (they're usually more directly relevant)
+            if len(faq_docs) > 0:
+                reranked_docs = faq_docs[:4] + other_docs  # Prioritize up to 4 FAQ docs
             else:
-                # Use the default chain
-                if self.debug:
-                    logger.debug("Using default retriever without filters")
-                
-                retrieval_time = time.time() - retrieval_start
-                logger.info(f"Retrieval completed in {retrieval_time:.2f} seconds")
-                
-                generation_start = time.time()
-                response = self.qa_chain.invoke(question)
-                generation_time = time.time() - generation_start
-                
+                reranked_docs = unique_docs
+
+            # Limit to a reasonable number for context
+            final_docs = reranked_docs[:8]
+
+            # Store for citation generation
+            self.last_retrieved_docs = final_docs
+
+            # Format for context
+            context = "\n\n".join([doc.page_content for doc in final_docs])
+
+            # Generate answer
+            generation_start = time.time()
+            response = self.llm.invoke(
+                self.prompt_template.format(context=context, question=question)
+            ).content
+            generation_time = time.time() - generation_start
+
             # Generate citations
             citations = self.get_citations()
-            
+
             total_time = time.time() - start_time
             logger.info(f"Response generated in {total_time:.2f} seconds")
-            logger.info(f"- Retrieval: {retrieval_time:.2f}s, Generation: {generation_time:.2f}s")
-            logger.info(f"- Used {len(self.last_retrieved_docs)} docs, Generated {len(citations)} citations")
-            
+            logger.info(f"- Query refinement: {query_refinement_time:.2f}s")
+            logger.info(f"- Retrieval: {retrieval_time:.2f}s")
+            logger.info(f"- Generation: {generation_time:.2f}s")
+            logger.info(f"- Used {len(final_docs)} docs, Generated {len(citations)} citations")
+
             # Log a preview of the response
             response_preview = response[:100] + "..." if len(response) > 100 else response
             logger.info(f"Response: {response_preview}")
-            
+
             return {
                 "answer": response,
-                "citations": citations
+                "citations": citations,
+                "refined_queries": refined_queries[1:] if len(refined_queries) > 1 else []  # Skip original query
             }
         except Exception as e:
             error_time = time.time() - start_time
@@ -684,7 +765,7 @@ Answer:"""
             if self.debug:
                 import traceback
                 logger.debug(traceback.format_exc())
-            
+
             return {
                 "answer": "I'm sorry, I encountered an error while processing your question. Please try again.",
                 "citations": []
@@ -715,9 +796,6 @@ def setup_gradio_interface(rag_system):
         
         query_time = time.time() - query_start
         logger.info(f"Total response time: {query_time:.2f} seconds")
-        
-        # Update history
-        history.append((message, formatted_response))
         
         return formatted_response
     
